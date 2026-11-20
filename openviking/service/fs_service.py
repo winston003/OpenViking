@@ -935,13 +935,18 @@ class FSService:
             refresh_ratio=getattr(semantic_config, "freshness_refresh_ratio", 0.10),
             force_refresh=force_refresh,
         )
+        # Deletion must be respected immediately on every branch: the surgical
+        # removal is deterministic and VLM-free, so run it before enqueueing a
+        # (possibly lagging) full refresh. It is idempotent; the queued
+        # regeneration still rewrites the overview from current files and
+        # simply finds nothing left to remove.
+        await self._surgically_remove_deleted_entry(
+            root_uri=root_uri,
+            deleted_uri=deleted_uri,
+            context_type=context_type,
+            ctx=ctx,
+        )
         if decision.action is not FreshnessAction.REFRESH_NOW:
-            await self._surgically_remove_deleted_entry(
-                root_uri=root_uri,
-                deleted_uri=deleted_uri,
-                context_type=context_type,
-                ctx=ctx,
-            )
             return decision.action
         try:
             queue_manager = get_queue_manager()
