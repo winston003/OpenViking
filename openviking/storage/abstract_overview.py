@@ -525,6 +525,105 @@ def remove_overview_entry(body: str, entry_name: str) -> tuple[str, bool]:
     return new_body, True
 
 
+def overview_entry_names(body: str) -> list[str]:
+    """List direct entry names referenced by an overview body.
+
+    Mirrors the entry forms overview generation produces: ``### [name](viking://...)``
+    H3 headings, ``[n] name: summary`` lines, and ``- name (link: ...)`` bullets.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for line in (body or "").replace("\r\n", "\n").split("\n"):
+        heading_match = re.match(r"^###\s+(.+?)\s*$", line)
+        numbered_match = None if heading_match else re.match(r"^\[(\d+)\]\s+(.+?):", line)
+        bullet_match = (
+            None if heading_match or numbered_match else re.match(r"^-\s+(.+?)\s*\(link:", line)
+        )
+        name = None
+        if heading_match:
+            name = _overview_heading_file_name(heading_match.group(1))
+        elif numbered_match:
+            name = numbered_match.group(2).strip()
+        elif bullet_match:
+            name = bullet_match.group(1).strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+async def _entry_exists(viking_fs: Any, uri: str, ctx: Optional[RequestContext]) -> bool:
+    """Best-effort existence probe; a failing probe keeps the entry."""
+    try:
+        return bool(await viking_fs.exists(uri, ctx=ctx))
+    except Exception:
+        return True
+
+
+async def _drop_missing_entries(
+    *,
+    viking_fs: Any,
+    dir_uri: str,
+    overview: str,
+    abstract: str,
+    metadata: Mapping[str, Any],
+    ctx: Optional[RequestContext],
+    log_prefix: str,
+) -> tuple[str, str, Optional[Dict[str, Any]]]:
+    """Drop overview/abstract entries whose source no longer exists at write time.
+
+    Regeneration can start before a concurrent delete lands and commit after
+    it, resurfacing deleted content in the sidecars — and from there into
+    retrieval and answers. Checking existence when the sidecar is written is
+    race-proof by construction: a stale generation snapshot simply loses its
+    dead entries instead of publishing them.
+
+    The filter only engages when the filesystem exposes a path-existence probe
+    (``exists``): guessing existence from read errors would misread storage
+    backends that cannot read directories. Conservative by design: a probe
+    error keeps the entry, and the queued regeneration stays responsible for
+    everything else.
+    """
+    if getattr(viking_fs, "exists", None) is None:
+        return overview, abstract, None
+    names = overview_entry_names(overview)
+    if not names:
+        return overview, abstract, None
+    base = _normalize_directory_uri(dir_uri)
+    dead: list[str] = []
+    for name in names:
+        if not await _entry_exists(viking_fs, f"{base}{name}", ctx):
+            dead.append(name)
+    if not dead:
+        return overview, abstract, None
+    new_overview = overview
+    new_abstract = abstract
+    for name in dead:
+        new_overview, _ = remove_overview_entry(new_overview, name)
+        new_abstract, _ = remove_overview_entry(new_abstract, name)
+    logger.info(
+        "%s Dropped %d sidecar entr%s whose source no longer exists in %s: %s",
+        log_prefix,
+        len(dead),
+        "y" if len(dead) == 1 else "ies",
+        dir_uri,
+        ", ".join(dead),
+    )
+    freshness = metadata.get("freshness") if isinstance(metadata, Mapping) else None
+    if not isinstance(freshness, Mapping):
+        return new_overview, new_abstract, None
+    try:
+        total = int(freshness.get("total_entries", 0))
+        sampled = int(freshness.get("sampled_entries", 0))
+        pending = int(freshness.get("pending_child_changes", 0))
+    except (TypeError, ValueError):
+        return new_overview, new_abstract, None
+    remaining = max(total - len(dead), 0)
+    return new_overview, new_abstract, freshness_metadata(
+        remaining, min(max(sampled, 0), remaining), pending
+    )
+
+
 def body_for_embedding(
     raw: str | bytes,
     whitelist: Sequence[str] = EMBEDDING_METADATA_FIELDS,
@@ -641,6 +740,21 @@ async def write_abstract_overview(
             logger.info("%s Skipping stale semantic write for %s", log_prefix, dir_uri)
             return AbstractOverviewWriteResult(wrote=False)
 
+        # Write-time existence filter: a regeneration whose snapshot predates a
+        # concurrent delete must not publish deleted entries (they resurface in
+        # retrieval and answers). Applied under the sidecar lease to every
+        # write path; the surgical removal path passes already-clean bodies and
+        # finds nothing to drop.
+        overview, abstract, filtered_freshness = await _drop_missing_entries(
+            viking_fs=viking_fs,
+            dir_uri=dir_uri,
+            overview=overview,
+            abstract=abstract,
+            metadata=dict(metadata or {}),
+            ctx=ctx,
+            log_prefix=log_prefix,
+        )
+
         existing_overview = (
             parse_abstract_overview(existing_raw[1])
             if existing_raw is not None and 1 in existing_raw
@@ -656,6 +770,8 @@ async def write_abstract_overview(
             else None
         )
         merged_metadata = dict(metadata or {})
+        if filtered_freshness is not None:
+            merged_metadata["freshness"] = filtered_freshness
         for existing in (existing_overview, existing_abstract):
             if existing and "source" in existing.metadata and "source" not in merged_metadata:
                 merged_metadata["source"] = existing.metadata["source"]

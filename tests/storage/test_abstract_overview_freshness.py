@@ -283,3 +283,73 @@ async def test_delete_removal_updates_sidecars_and_keeps_pending_counter():
     assert "chart.png" not in overview_after.body
     assert "[notes.txt]" in overview_after.body
     assert overview_after.metadata["freshness"]["pending_child_changes"] == 4
+
+
+class _FakeFSWithSources(_FakeFS):
+    """_FakeFS plus the path-existence probe the write-time filter uses."""
+
+    def __init__(self, files, existing_sources=()):
+        super().__init__(files)
+        self.existing_sources = set(existing_sources)
+
+    async def exists(self, uri, ctx=None):
+        return uri in self.existing_sources
+
+
+@pytest.mark.asyncio
+async def test_write_drops_entries_whose_source_no_longer_exists():
+    """A regeneration snapshot that predates a delete must not publish the
+    deleted entry: the write-time existence filter drops it from both
+    sidecars and repairs the freshness counters."""
+    dir_uri = "viking://resources/wide"
+    files = _overview_files_with_entries(dir_uri)
+    overview_doc = parse_abstract_overview(files[f"{dir_uri}/.overview.md"])
+    abstract_doc = parse_abstract_overview(files[f"{dir_uri}/.abstract.md"])
+    fs = _FakeFSWithSources(files, existing_sources={f"{dir_uri}/notes.txt"})
+
+    result = await write_abstract_overview(
+        viking_fs=fs,
+        dir_uri=dir_uri,
+        overview=overview_doc.body,
+        abstract=abstract_doc.body,
+        ctx=None,
+        metadata=dict(overview_doc.metadata),
+    )
+
+    assert result.wrote
+    overview_after = parse_abstract_overview(fs.files[f"{dir_uri}/.overview.md"])
+    assert "chart.png" not in overview_after.body
+    assert "data.csv" not in overview_after.body
+    assert "[notes.txt]" in overview_after.body
+    freshness = overview_after.metadata["freshness"]
+    assert freshness["total_entries"] == 161 - 2
+    assert freshness["pending_child_changes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_write_keeps_entries_whose_source_still_exists():
+    """Entries backed by existing sources survive the write-time filter."""
+    dir_uri = "viking://resources/wide"
+    files = _overview_files_with_entries(dir_uri)
+    overview_doc = parse_abstract_overview(files[f"{dir_uri}/.overview.md"])
+    abstract_doc = parse_abstract_overview(files[f"{dir_uri}/.abstract.md"])
+    fs = _FakeFSWithSources(
+        files,
+        existing_sources={
+            f"{dir_uri}/chart.png",
+            f"{dir_uri}/notes.txt",
+            f"{dir_uri}/data.csv",
+        },
+    )
+
+    result = await write_abstract_overview(
+        viking_fs=fs,
+        dir_uri=dir_uri,
+        overview=overview_doc.body,
+        abstract=abstract_doc.body,
+        ctx=None,
+        metadata=dict(overview_doc.metadata),
+    )
+
+    assert not result.overview_body_changed
+    assert "chart.png" in overview_doc.body and "chart.png" in fs.files[f"{dir_uri}/.overview.md"]
