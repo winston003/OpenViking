@@ -695,6 +695,36 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             raise RuntimeError(f"failed to create missing vector record: {record_id}")
         return {"id": record_id, "status": "created"}
 
+    async def _publish_memory_embedding(
+        self,
+        record: Dict[str, Any],
+        source_sha256: Optional[str],
+        ctx: RequestContext,
+        options: Dict[str, Any],
+    ) -> Optional[str]:
+        """Serialize memory-detail publication with writes and deletion of its source."""
+        from openviking.storage.pathlock_transfer import PathLockGuard
+        from openviking.storage.viking_fs import get_viking_fs
+
+        viking_fs = get_viking_fs()
+        uri = record["uri"]
+        path = viking_fs._uri_to_path(uri, ctx=ctx)
+        agfs = viking_fs._async_agfs
+        guard = PathLockGuard(agfs)
+        try:
+            await guard.acquire(lambda: agfs.pathlock_acquire_exact(path))
+            if not await viking_fs.exists(uri, ctx=ctx):
+                return None
+            if source_sha256 is not None:
+                content = await viking_fs.read_file(uri, ctx=ctx)
+                if hashlib.sha256(content.encode("utf-8")).hexdigest() != source_sha256:
+                    return None
+            return await run_to_completion(
+                lambda: self._vikingdb.upsert(record, ctx=ctx, options=options)
+            )
+        finally:
+            await guard.close()
+
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
         """Process dequeued message and add embedding vector(s)."""
         if not data:
@@ -887,6 +917,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                 # Write to vector database
                 try:
+                    memory_source_sha256 = inserted_data.pop("_memory_source_sha256", None)
                     raw_upsert_options = inserted_data.pop("_upsert_options", {})
                     extracted_memory_type = raw_upsert_options.pop("extracted_memory_type", None)
                     # Reuse the actual vector-store ID when a semantic plan
@@ -951,7 +982,16 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     upsert_options = normalize_upsert_options(
                         {**raw_upsert_options, "partial_update": False}
                     )
-                    if inserted_data.get("context_type") == ContextType.SKILL.value:
+                    if (
+                        inserted_data.get("context_type") == ContextType.MEMORY.value
+                        and inserted_data.get("is_leaf")
+                        and inserted_data.get("level", 2) == 2
+                        and uri
+                    ):
+                        result = await self._publish_memory_embedding(
+                            inserted_data, memory_source_sha256, ctx, upsert_options
+                        )
+                    elif inserted_data.get("context_type") == ContextType.SKILL.value:
                         # Cancelling the waiter cannot stop a threaded DB write.
                         # Keep this task active until that write has settled.
                         result = await run_to_completion(

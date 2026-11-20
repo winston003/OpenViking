@@ -2196,6 +2196,9 @@ class MemoryUpdater:
                 # Convert to embedding msg and enqueue
                 embedding_msg = EmbeddingMsgConverter.from_context(memory_context)
                 if embedding_msg:
+                    embedding_msg.context_data["_memory_source_sha256"] = hashlib.sha256(
+                        content.encode("utf-8")
+                    ).hexdigest()
                     if getattr(ingest_options, "search_tags", None) is not None:
                         embedding_msg.context_data["search_tags"] = list(ingest_options.search_tags)
                         embedding_msg.context_data["_upsert_options"] = {
